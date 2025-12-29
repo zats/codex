@@ -17,6 +17,7 @@ use codex_cli::login::run_login_with_device_code;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
+use codex_common::oss::get_default_model_for_oss_provider;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
@@ -28,6 +29,7 @@ use codex_tui::update_action::UpdateAction;
 use codex_tui2 as tui2;
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use supports_color::Stream;
 
 mod mcp_cmd;
@@ -36,14 +38,23 @@ mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;
 
+use codex_core::AuthManager;
+use codex_core::ConversationManager;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::resolve_oss_provider;
 use codex_core::features::Feature;
 use codex_core::features::FeatureOverrides;
 use codex_core::features::Features;
 use codex_core::features::is_known_feature_key;
+use codex_core::find_conversation_path_by_id_str;
+use codex_core::fork_history_from_rollout;
+use codex_core::protocol::SessionSource;
+use codex_core::protocol_config_types::SandboxMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 /// Codex CLI
@@ -117,6 +128,9 @@ enum Subcommand {
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
 
+    /// Fork a previous interactive session and start it in a new terminal window.
+    Fork(ForkCommand),
+
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
@@ -154,6 +168,29 @@ struct ResumeCommand {
     /// Show all sessions (disables cwd filtering and shows CWD column).
     #[arg(long = "all", default_value_t = false)]
     all: bool,
+
+    #[clap(flatten)]
+    config_overrides: TuiCli,
+}
+
+#[derive(Debug, Parser)]
+struct ForkCommand {
+    /// Conversation/session id (UUID). When provided, forks this session.
+    /// If omitted, use --last to pick the most recent recorded session.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: Option<String>,
+
+    /// Fork the most recent session without showing the picker.
+    #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
+    last: bool,
+
+    /// Show all sessions (disables cwd filtering and shows CWD column).
+    #[arg(long = "all", default_value_t = false)]
+    all: bool,
+
+    /// Fork in the current terminal instead of launching a new one.
+    #[arg(long = "inline", default_value_t = false)]
+    inline: bool,
 
     #[clap(flatten)]
     config_overrides: TuiCli,
@@ -509,6 +546,44 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
         }
+        Some(Subcommand::Fork(ForkCommand {
+            session_id,
+            last,
+            all,
+            inline,
+            config_overrides,
+        })) => {
+            if inline {
+                interactive = finalize_fork_interactive(
+                    interactive,
+                    root_config_overrides.clone(),
+                    session_id,
+                    last,
+                    all,
+                    config_overrides,
+                );
+                let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
+                handle_app_exit(exit_info)?;
+            } else {
+                let fork_session_id = session_id.clone();
+                let fork_cli = finalize_fork_interactive(
+                    interactive,
+                    root_config_overrides.clone(),
+                    session_id,
+                    last,
+                    all,
+                    config_overrides,
+                );
+                let config = load_config_for_fork(fork_cli, codex_linux_sandbox_exe).await?;
+                let fork_path = resolve_fork_path(&config, fork_session_id, last).await?;
+                let new_id = fork_session(&config, fork_path).await?;
+                let resume_command = resume_command_for_current_exe(&new_id);
+                if let Err(err) = launch_new_terminal(&resume_command) {
+                    eprintln!("Failed to launch new terminal: {err}");
+                    eprintln!("Run this manually: {resume_command}");
+                }
+            }
+        }
         Some(Subcommand::Login(mut login_cli)) => {
             prepend_config_flags(
                 &mut login_cli.config_overrides,
@@ -727,6 +802,27 @@ fn finalize_resume_interactive(
     interactive
 }
 
+/// Build the final `TuiCli` for a `codex fork` invocation.
+fn finalize_fork_interactive(
+    mut interactive: TuiCli,
+    root_config_overrides: CliConfigOverrides,
+    session_id: Option<String>,
+    last: bool,
+    show_all: bool,
+    fork_cli: TuiCli,
+) -> TuiCli {
+    let fork_session_id = session_id;
+    interactive.fork_picker = fork_session_id.is_none() && !last;
+    interactive.fork_last = last;
+    interactive.fork_session_id = fork_session_id;
+    interactive.fork_show_all = show_all;
+
+    merge_resume_cli_flags(&mut interactive, fork_cli);
+    prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
+
+    interactive
+}
+
 /// Merge flags provided to `codex resume` so they take precedence over any
 /// root-level flags. Only overrides fields explicitly set on the resume-scoped
 /// CLI. Also appends `-c key=value` overrides with highest precedence.
@@ -772,6 +868,276 @@ fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
         .config_overrides
         .raw_overrides
         .extend(resume_cli.config_overrides.raw_overrides);
+}
+
+async fn load_config_for_fork(
+    mut cli: TuiCli,
+    codex_linux_sandbox_exe: Option<PathBuf>,
+) -> anyhow::Result<Config> {
+    let (sandbox_mode, approval_policy) = if cli.full_auto {
+        (
+            Some(SandboxMode::WorkspaceWrite),
+            Some(codex_core::protocol::AskForApproval::OnRequest),
+        )
+    } else if cli.dangerously_bypass_approvals_and_sandbox {
+        (
+            Some(SandboxMode::DangerFullAccess),
+            Some(codex_core::protocol::AskForApproval::Never),
+        )
+    } else {
+        (
+            cli.sandbox_mode.map(Into::<SandboxMode>::into),
+            cli.approval_policy.map(Into::into),
+        )
+    };
+
+    if cli.web_search {
+        cli.config_overrides
+            .raw_overrides
+            .push("features.web_search_request=true".to_string());
+    }
+
+    let raw_overrides = cli.config_overrides.raw_overrides.clone();
+    let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
+    let cli_kv_overrides = overrides_cli
+        .parse_overrides()
+        .map_err(|e| anyhow::anyhow!("Error parsing -c overrides: {e}"))?;
+
+    let codex_home =
+        find_codex_home().map_err(|e| anyhow::anyhow!("Error finding codex home: {e}"))?;
+    let cwd = cli.cwd.clone();
+    let config_cwd = match cwd.as_deref() {
+        Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
+        None => AbsolutePathBuf::current_dir()?,
+    };
+
+    let config_toml =
+        load_config_as_toml_with_cli_overrides(&codex_home, &config_cwd, cli_kv_overrides.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Error loading config.toml: {e}"))?;
+
+    let model_provider_override = if cli.oss {
+        let resolved = resolve_oss_provider(
+            cli.oss_provider.as_deref(),
+            &config_toml,
+            cli.config_profile.clone(),
+        );
+
+        if let Some(provider) = resolved {
+            Some(provider)
+        } else {
+            return Err(anyhow::anyhow!(
+                "No default OSS provider configured. Use --local-provider=provider or set oss_provider in config.toml"
+            ));
+        }
+    } else {
+        None
+    };
+
+    let model = if let Some(model) = &cli.model {
+        Some(model.clone())
+    } else if cli.oss {
+        model_provider_override
+            .as_ref()
+            .and_then(|provider_id| get_default_model_for_oss_provider(provider_id))
+            .map(std::borrow::ToOwned::to_owned)
+    } else {
+        None
+    };
+
+    let overrides = ConfigOverrides {
+        model,
+        approval_policy,
+        sandbox_mode,
+        cwd,
+        model_provider: model_provider_override,
+        config_profile: cli.config_profile.clone(),
+        codex_linux_sandbox_exe,
+        show_raw_agent_reasoning: cli.oss.then_some(true),
+        additional_writable_roots: cli.add_dir.clone(),
+        ..Default::default()
+    };
+
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
+    Ok(config)
+}
+
+async fn resolve_fork_path(
+    config: &Config,
+    session_id: Option<String>,
+    last: bool,
+) -> anyhow::Result<PathBuf> {
+    if let Some(id) = session_id {
+        return find_conversation_path_by_id_str(&config.codex_home, &id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to locate conversation id {id}: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("No rollout found for conversation id {id}"));
+    }
+
+    if last {
+        let provider_filter = vec![config.model_provider_id.clone()];
+        let page = RolloutRecorder::list_conversations(
+            &config.codex_home,
+            1,
+            None,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            &config.model_provider_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+        return page
+            .items
+            .first()
+            .map(|it| it.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("No sessions found to fork"));
+    }
+
+    Err(anyhow::anyhow!(
+        "Provide a SESSION_ID or pass --last to fork the most recent session"
+    ))
+}
+
+async fn fork_session(config: &Config, path: PathBuf) -> anyhow::Result<String> {
+    let auth_manager = Arc::new(AuthManager::new(
+        config.codex_home.clone(),
+        false,
+        config.cli_auth_credentials_store_mode,
+    ));
+    let conversation_manager = ConversationManager::new(auth_manager.clone(), SessionSource::Cli);
+    let history = fork_history_from_rollout(&path).await?;
+    let forked = conversation_manager
+        .resume_conversation_with_history(config.clone(), history, auth_manager)
+        .await?;
+    let new_id = forked.conversation_id.to_string();
+    let _ = forked
+        .conversation
+        .submit(codex_core::protocol::Op::Shutdown)
+        .await;
+    Ok(new_id)
+}
+
+fn launch_new_terminal(command: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        fn escape_osascript(input: &str) -> String {
+            input.replace('\\', "\\\\").replace('\"', "\\\"")
+        }
+
+        fn run_osascript(script: &str) -> anyhow::Result<()> {
+            let status = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+            Err(anyhow::anyhow!("osascript exited with {status}"))
+        }
+
+        fn frontmost_app_name() -> Option<String> {
+            let output = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(
+                    "tell application \"System Events\" to get name of first application process whose frontmost is true",
+                )
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        }
+
+        fn resolve_app_name(term_program: Option<String>, frontmost: Option<String>) -> String {
+            if let Some(frontmost) = frontmost {
+                return frontmost;
+            }
+            let term_program = term_program.unwrap_or_default();
+            let term_lower = term_program.to_ascii_lowercase();
+            if term_lower.contains("iterm") {
+                return "iTerm2".to_string();
+            }
+            if term_lower.contains("apple_terminal")
+                || term_lower.contains("terminal.app")
+                || term_lower == "terminal"
+            {
+                return "Terminal".to_string();
+            }
+            if term_lower.contains("ghostty") {
+                return "Ghostty".to_string();
+            }
+            if term_program.is_empty() {
+                "Terminal".to_string()
+            } else {
+                term_program
+            }
+        }
+
+        fn launch_window_with_system_events(app_name: &str, command: &str) -> anyhow::Result<()> {
+            let escaped_app = escape_osascript(app_name);
+            let escaped_cmd = escape_osascript(command);
+            let script = format!(
+                "tell application \"{escaped_app}\" to activate\n\
+                 tell application \"System Events\"\n\
+                 tell process \"{escaped_app}\"\n\
+                 set frontmost to true\n\
+                 keystroke \"n\" using {{command down}}\n\
+                 delay 0.1\n\
+                 keystroke \"{escaped_cmd}\"\n\
+                 key code 36\n\
+                 end tell\n\
+                 end tell"
+            );
+            run_osascript(&script)
+        }
+
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let app_name = resolve_app_name(term_program, frontmost_app_name());
+        return launch_window_with_system_events(&app_name, command);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(command)
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("cmd start exited with {status}"));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err(anyhow::anyhow!(
+            "automatic terminal launch is not supported on this platform"
+        ))
+    }
+}
+
+fn resume_command_for_current_exe(session_id: &str) -> String {
+    let fallback = format!("codex resume {session_id}");
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return fallback,
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let exe_str = exe.to_string_lossy().replace('\"', "\\\"");
+        format!("\"{exe_str}\" resume {session_id}")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe_str = exe.to_string_lossy().replace('\'', "'\\''");
+        format!("'{exe_str}' resume {session_id}")
+    }
 }
 
 fn print_completion(cmd: CompletionCommand) {

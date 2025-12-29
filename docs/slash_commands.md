@@ -17,6 +17,7 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/review`       | review my current changes and find issues                                  |
 | `/new`          | start a new chat during a conversation                                     |
 | `/resume`       | resume an old chat                                                         |
+| `/fork`         | fork the current chat into a new session                                   |
 | `/init`         | create an AGENTS.md file with instructions for Codex                       |
 | `/compact`      | summarize conversation to prevent hitting the context limit                |
 | `/diff`         | show git diff (including untracked files)                                  |

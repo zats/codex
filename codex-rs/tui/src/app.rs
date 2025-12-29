@@ -28,6 +28,7 @@ use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 #[cfg(target_os = "windows")]
 use codex_core::features::Feature;
+use codex_core::fork_history_from_rollout;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -42,6 +43,7 @@ use codex_protocol::ConversationId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use color_eyre::eyre::bail;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
@@ -89,6 +91,127 @@ fn session_summary(
         usage_line,
         resume_command,
     })
+}
+
+fn resume_command_for_current_exe(session_id: &str) -> String {
+    let fallback = format!("codex resume {session_id}");
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return fallback,
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let exe_str = exe.to_string_lossy().replace('\"', "\\\"");
+        format!("\"{exe_str}\" resume {session_id}")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe_str = exe.to_string_lossy().replace('\'', "'\\''");
+        format!("'{exe_str}' resume {session_id}")
+    }
+}
+
+fn launch_new_terminal(command: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        fn escape_osascript(input: &str) -> String {
+            input.replace('\\', "\\\\").replace('\"', "\\\"")
+        }
+
+        fn run_osascript(script: &str) -> Result<()> {
+            let status = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+            bail!("osascript exited with {status}");
+        }
+
+        fn frontmost_app_name() -> Option<String> {
+            let output = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(
+                    "tell application \"System Events\" to get name of first application process whose frontmost is true",
+                )
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        }
+
+        fn resolve_app_name(term_program: Option<String>, frontmost: Option<String>) -> String {
+            if let Some(frontmost) = frontmost {
+                return frontmost;
+            }
+            let term_program = term_program.unwrap_or_default();
+            let term_lower = term_program.to_ascii_lowercase();
+            if term_lower.contains("iterm") {
+                return "iTerm2".to_string();
+            }
+            if term_lower.contains("apple_terminal")
+                || term_lower.contains("terminal.app")
+                || term_lower == "terminal"
+            {
+                return "Terminal".to_string();
+            }
+            if term_lower.contains("ghostty") {
+                return "Ghostty".to_string();
+            }
+            if term_program.is_empty() {
+                "Terminal".to_string()
+            } else {
+                term_program
+            }
+        }
+
+        fn launch_window_with_system_events(app_name: &str, command: &str) -> Result<()> {
+            let escaped_app = escape_osascript(app_name);
+            let escaped_cmd = escape_osascript(command);
+            let script = format!(
+                "tell application \"{escaped_app}\" to activate\n\
+                 tell application \"System Events\"\n\
+                 tell process \"{escaped_app}\"\n\
+                 set frontmost to true\n\
+                 keystroke \"n\" using {{command down}}\n\
+                 delay 0.1\n\
+                 keystroke \"{escaped_cmd}\"\n\
+                 key code 36\n\
+                 end tell\n\
+                 end tell"
+            );
+            run_osascript(&script)
+        }
+
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let app_name = resolve_app_name(term_program, frontmost_app_name());
+        return launch_window_with_system_events(&app_name, command);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(command)
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("cmd start exited with {status}");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = command;
+        bail!("opening a new terminal is not supported on this platform");
+    }
 }
 
 fn errors_for_cwd(cwd: &Path, response: &ListSkillsResponseEvent) -> Vec<SkillErrorInfo> {
@@ -332,6 +455,69 @@ impl App {
         }
     }
 
+    async fn fork_current_session(&mut self) {
+        let Some(path) = self.chat_widget.rollout_path() else {
+            self.chat_widget.add_error_message("Rollout path is not available yet.".to_string());
+            return;
+        };
+
+        let mut fork_config = self.config.clone();
+        fork_config.model = Some(self.current_model.clone());
+
+        let history = match fork_history_from_rollout(&path).await {
+            Ok(history) => history,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to load session history from {}: {err}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+
+        let forked = match self
+            .server
+            .resume_conversation_with_history(
+                fork_config,
+                history,
+                self.auth_manager.clone(),
+            )
+            .await
+        {
+            Ok(forked) => forked,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to fork session from {}: {err}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+
+        let new_id = forked.conversation_id.to_string();
+        let _ = forked.conversation.submit(Op::Shutdown).await;
+        self.server.remove_conversation(&forked.conversation_id).await;
+
+        let command = resume_command_for_current_exe(&new_id);
+        match launch_new_terminal(&command) {
+            Ok(()) => {
+                self.chat_widget.add_info_message(
+                    format!("Forked session {new_id} in a new terminal."),
+                    Some(format!("Command: {command}")),
+                );
+            }
+            Err(err) => {
+                self.chat_widget.add_info_message(
+                    format!("Forked session {new_id}."),
+                    Some(format!("Run `{command}` to continue.")),
+                );
+                self.chat_widget.add_error_message(format!(
+                    "Failed to open a new terminal: {err}"
+                ));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
@@ -422,6 +608,29 @@ impl App {
                     resumed.conversation,
                     resumed.session_configured,
                 )
+            }
+            ResumeSelection::Fork(path) => {
+                let history = fork_history_from_rollout(&path).await.wrap_err_with(|| {
+                    format!("Failed to load session history from {}", path.display())
+                })?;
+                let forked = conversation_manager
+                    .resume_conversation_with_history(config.clone(), history, auth_manager.clone())
+                    .await
+                    .wrap_err_with(|| format!("Failed to fork session from {}", path.display()))?;
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: app_event_tx.clone(),
+                    initial_prompt: initial_prompt.clone(),
+                    initial_images: initial_images.clone(),
+                    enhanced_keys_supported,
+                    auth_manager: auth_manager.clone(),
+                    models_manager: conversation_manager.get_models_manager(),
+                    feedback: feedback.clone(),
+                    is_first_run,
+                    model_family: model_family.clone(),
+                };
+                ChatWidget::new_from_existing(init, forked.conversation, forked.session_configured)
             }
         };
 
@@ -661,11 +870,16 @@ impl App {
                             }
                         }
                     }
-                    ResumeSelection::Exit | ResumeSelection::StartFresh => {}
+                    ResumeSelection::Fork(_)
+                    | ResumeSelection::Exit
+                    | ResumeSelection::StartFresh => {}
                 }
 
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ForkCurrentSession => {
+                self.fork_current_session().await;
             }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();

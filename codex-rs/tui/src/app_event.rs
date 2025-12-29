@@ -26,6 +26,9 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
+    /// Fork the current session into a new one without leaving the active chat.
+    ForkCurrentSession,
+
     /// Request to exit the application gracefully.
     ExitRequest,
 

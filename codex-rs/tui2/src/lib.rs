@@ -447,8 +447,83 @@ async fn run_ratatui_app(
         initial_config
     };
 
-    // Determine resume behavior: explicit id, then resume last, then picker.
-    let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
+    let fork_selection = if let Some(id_str) = cli.fork_session_id.as_deref() {
+        match find_conversation_path_by_id_str(&config.codex_home, id_str).await? {
+            Some(path) => Some(resume_picker::ResumeSelection::Fork(path)),
+            None => {
+                error!("Error finding conversation path: {id_str}");
+                restore();
+                session_log::log_session_end();
+                let _ = tui.terminal.clear();
+                if let Err(err) = writeln!(
+                    std::io::stdout(),
+                    "No saved session found with ID {id_str}. Run `codex fork` without an ID to choose from existing sessions."
+                ) {
+                    error!("Failed to write fork error message: {err}");
+                }
+                return Ok(AppExitInfo {
+                    token_usage: codex_core::protocol::TokenUsage::default(),
+                    conversation_id: None,
+                    update_action: None,
+                    session_lines: Vec::new(),
+                });
+            }
+        }
+    } else if cli.fork_last {
+        let provider_filter = vec![config.model_provider_id.clone()];
+        match RolloutRecorder::list_conversations(
+            &config.codex_home,
+            1,
+            None,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            &config.model_provider_id,
+        )
+        .await
+        {
+            Ok(page) => page
+                .items
+                .first()
+                .map(|it| resume_picker::ResumeSelection::Fork(it.path.clone())),
+            Err(_) => None,
+        }
+    } else if cli.fork_picker {
+        match resume_picker::run_resume_picker(
+            &mut tui,
+            &config.codex_home,
+            &config.model_provider_id,
+            cli.fork_show_all,
+        )
+        .await?
+        {
+            resume_picker::ResumeSelection::Exit => {
+                restore();
+                session_log::log_session_end();
+                return Ok(AppExitInfo {
+                    token_usage: codex_core::protocol::TokenUsage::default(),
+                    conversation_id: None,
+                    update_action: None,
+                    session_lines: Vec::new(),
+                });
+            }
+            resume_picker::ResumeSelection::Resume(path) => {
+                Some(resume_picker::ResumeSelection::Fork(path))
+            }
+            resume_picker::ResumeSelection::StartFresh => {
+                Some(resume_picker::ResumeSelection::StartFresh)
+            }
+            resume_picker::ResumeSelection::Fork(path) => {
+                Some(resume_picker::ResumeSelection::Fork(path))
+            }
+        }
+    } else {
+        None
+    };
+
+    // Determine resume behavior: fork selection takes precedence, then explicit resume id, then last, then picker.
+    let resume_selection = if let Some(selection) = fork_selection {
+        selection
+    } else if let Some(id_str) = cli.resume_session_id.as_deref() {
         match find_conversation_path_by_id_str(&config.codex_home, id_str).await? {
             Some(path) => resume_picker::ResumeSelection::Resume(path),
             None => {
